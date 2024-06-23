@@ -1,0 +1,708 @@
+```{r}
+library(ETAS.inlabru)
+
+library(tidyquant)
+library(gridExtra)
+library(grid)
+library(lemon)
+library(ggplot2)
+library(ggpubr)
+library(GGally)
+
+library(inlabru)
+library(INLA)
+library(ETAS.inlabru)
+
+# inla.setOption(pardiso.license="~/sys/licences/pardiso.lic")
+
+library(dplyr)
+
+num.cores <- 2
+future::plan(future::multisession, workers = num.cores)
+INLA::inla.setOption(num.threads = num.cores)
+```
+
+```{r}
+filter_data <- function(data, start.date, end.date, min.longitude, max.longitude, min.latitude, max.latitude, M0) {
+  data$time_date <- as.POSIXct(data$time_string, format = "%Y-%m-%dT%H:%M:%OS")
+  data <- na.omit(data)
+  
+  data.sel <- (data$time_date >= start.date) &
+              (data$time_date < end.date) &
+              (data$lon >= min.longitude) &
+              (data$lon <= max.longitude) &
+              (data$lat >= min.latitude) &
+              (data$lat <= max.latitude) &
+              (data$M >= M0)
+  filtered_data <- data[data.sel, ]
+  
+  p <- ggplot(filtered_data, aes(time_date, M)) +
+        geom_point() +
+        theme_bw()
+  print(p)
+  return(filtered_data)
+}
+
+```
+
+```{r}
+prepare_and_fit_model <- function(data, start.date, M0) {
+  data.bru <- data.frame(
+    ts = as.numeric(difftime(data$time_date, start.date, units = "days")),
+    magnitudes = data$M,
+    idx.p = 1:nrow(data)
+  )
+
+  link.f <- list(
+    mu = \(x) gamma_t(x, 1, 1),
+    K = \(x) unif_t(x, 0, 10),
+    alpha = \(x) gamma_t(x, 0.3, 0.6),
+    c_ = \(x) gamma_t(x, 0.1, 0.1),
+    p = \(x) unif_t(x, 1, 10)
+  )
+
+  inv.link.f <- list(
+    mu = \(x) inv_gamma_t(x, 1, 1),
+    K = \(x) inv_unif_t(x, 0, 10),
+    alpha = \(x) inv_gamma_t(x, 0.3, 0.6),
+    c_ = \(x) inv_gamma_t(x, 0.1, 0.1),
+    p = \(x) inv_unif_t(x, 1, 10)
+  )
+
+  th.init <- list(
+    th.mu = inv.link.f$mu(0.5),
+    th.K = inv.link.f$K(1),
+    th.alpha = inv.link.f$alpha(1),
+    th.c = inv.link.f$c_(0.1),
+    th.p = inv.link.f$p(1.1)
+  )
+
+  bru.opt.list <- list(
+    bru_verbose = 0,
+    bru_max_iter = 300,
+    bru_initial = th.init
+  )
+
+  T1 <- 0
+  T2 <- max(data.bru$ts) + 0.2
+
+  data.fit <- Temporal.ETAS(
+    total.data = data.bru,
+    M0 = M0,
+    T1 = T1,
+    T2 = T2,
+    link.functions = link.f,
+    coef.t. = 1,
+    delta.t. = 0.1,
+    N.max. = 5,
+    bru.opt = bru.opt.list
+  )
+
+  return(list(data.bru = data.bru, data.fit = data.fit, link.f = link.f, T1 = T1, T2 = T2))
+}
+
+```
+
+```{r}
+get_posterior_and_plot <- function(input_list, data.bru, T1, T2, M0) {
+  post.samp <- post_sampling(
+    input.list = input_list,
+    n.samp = 1000,
+    max.batch = 1000
+  )
+
+  beta.p <- 1 / (mean(data.bru$magnitudes) - M0)
+  
+  post.list <- get_posterior_param(input.list = input_list)
+  p1 <- post.list$post.plot
+
+  post.samp.mean <- colMeans(post.samp)
+  print(post.samp.mean)
+  print(beta.p)
+
+  input_list$T12 <- c(T1, T2)
+  input_list$M0 <- M0
+  input_list$catalog.bru <- data.bru
+  N.post <- get_posterior_N(input.list = input_list)
+  p2 <- N.post$post.plot
+  
+  p3 <- triggering_fun_plot(
+    input.list = input_list,
+    post.samp = post.samp,
+    n.samp = NULL,
+    magnitude = 3.5,
+    t.end = 4,
+    n.breaks = 100
+  )
+
+  p4 <- triggering_fun_plot_prior(
+    input.list = input_list,
+    magnitude = 3.5,
+    n.samp = 1000,
+    t.end = 10
+  )
+
+  p5 <- omori_plot_posterior(
+    input.list = input_list,
+    post.samp = post.samp,
+    n.samp = NULL,
+    t.end = 4
+  )
+
+  p6 <- omori_plot_prior(
+    input.list = input_list,
+    n.samp = 1000,
+    t.end = 5
+  )
+
+  return(list(post.samp = post.samp, beta.p = beta.p, 
+              p1 = p1,
+              p2 = p2,
+              p3 = p3,
+              p4 = p4,
+              p5 = p5,
+              p6 = p6))
+}
+
+```
+
+```{r}
+generate_synthetic_and_forecast <- function(input_list, post.samp, beta.p, data.bru, T1, T2, M0, p) {
+  synth.cat.list <- generate_temporal_ETAS_synthetic(
+    theta = post.samp[1, ], 
+    beta.p = beta.p,
+    M0 = M0,
+    T1 = T1,
+    T2 = T2,
+    Ht = data.bru[order(-data.bru$magnitudes), ][p, ]
+  )
+  synth.cat.df <- do.call(rbind, synth.cat.list)
+  synth.cat.df <- synth.cat.df[order(synth.cat.df$ts), ]
+  
+  p1 <- ggplot(synth.cat.df, aes(ts, magnitudes, color = as.factor(gen))) +
+    geom_point(size = 0.5)
+  
+  set.seed(2)
+  n.cat <- 8
+  multi.synth.cat.list <- lapply(seq_len(n.cat), \(x)
+    generate_temporal_ETAS_synthetic(
+      theta = post.samp[x, ],
+      beta.p = beta.p,
+      M0 = M0,
+      T1 = T1,
+      T2 = T2,
+      Ht = data.bru[order(-data.bru$magnitudes), ][p, ]
+    )
+  )
+  multi.synth.cat.list.df <- lapply(multi.synth.cat.list, \(x) do.call(rbind, x))
+  multi.synth.cat.list.df <- lapply(seq_len(n.cat), \(x) cbind(multi.synth.cat.list.df[[x]],
+    cat.idx = x
+  ))
+  multi.synth.cat.df <- do.call(rbind, multi.synth.cat.list.df)
+  
+  cat.df.for.plotting <- rbind(
+    multi.synth.cat.df,
+    cbind(data.bru[, c("ts", "magnitudes")],
+      gen = NA,
+      cat.idx = "observed"
+    )
+  )
+  
+  p2 <- ggplot(cat.df.for.plotting, aes(ts, magnitudes)) +
+    geom_point(size = 0.5) +
+    geom_point(
+      data = data.bru[order(-data.bru$magnitudes), ][p, ],
+      mapping = aes(ts, magnitudes),
+      color = "red"
+    ) +
+    facet_wrap(facets = ~cat.idx)
+  
+  min.in.days <- 1 / (24 * 60)
+  t.max.mag <- data.bru$ts[which.max(data.bru$magnitudes)]
+  T1.fore <- t.max.mag + min.in.days
+  fore.length <- 1
+  T2.fore <- T1.fore + fore.length
+  Ht.fore <- data.bru[data.bru$ts < T1.fore, ]
+  
+  daily.fore <- Temporal.ETAS.forecast(
+    post.samp = post.samp,
+    n.cat = nrow(post.samp),
+    beta.p = beta.p,
+    M0 = M0,
+    T1 = T1.fore,
+    T2 = T2.fore,
+    Ht = Ht.fore
+  )
+  
+  N.fore <- vapply(
+    seq_len(daily.fore$n.cat),
+    \(x) sum(daily.fore$fore.df$cat.idx == x), 0
+  )
+  N.obs <- sum(data.bru$ts >= T1.fore & data.bru$ts <= T2.fore)
+  
+  p3 <- ggplot() +
+    geom_histogram(aes(x = N.fore, y = after_stat(density)), binwidth = 1) +
+    geom_vline(xintercept = N.obs, color = "red") +
+    xlim(100, 500)
+
+  delta <- mean(N.fore <= N.obs)
+  
+  return(list(delta = delta, plot1 = p1, plot2 = p2, plot3 = p3))
+}
+
+```
+
+```{r}
+start.date1 <- as.POSIXct("2016-05-20T00:00:00", format = "%Y-%m-%dT%H:%M:%OS")
+end.date1 <- as.POSIXct("2017-05-20T00:00:00", format = "%Y-%m-%dT%H:%M:%OS")
+min.longitude1 <- 10.5
+max.longitude1 <- 16
+min.latitude1 <- 40.5
+max.latitude1 <- 45
+M0 <- 3
+```
+
+```{r}
+data1 <- filter_data(horus, 
+                     start.date1, 
+                     end.date1, 
+                     min.longitude1, 
+                     max.longitude1, 
+                     min.latitude1, 
+                     max.latitude1, 
+                     M0)
+```
+
+```{r}
+model_data1 <- prepare_and_fit_model(data1, start.date1, M0)
+input_list1 <- list(model.fit = model_data1$data.fit, 
+                    link.functions = model_data1$link.f)
+```
+
+```{r}
+posterior_data1 <- get_posterior_and_plot(input_list1, 
+                                          model_data1$data.bru, 
+                                          model_data1$T1,
+                                          model_data1$T2,
+                                          M0)
+posterior_data1$p1
+posterior_data1$p2
+posterior_data1$p3
+posterior_data1$p4
+posterior_data1$p5
+posterior_data1$p6
+```
+
+```{r}
+result1 <- generate_synthetic_and_forecast(input_list1, 
+                                           posterior_data1$post.samp, 
+                                           posterior_data1$beta.p, 
+                                           model_data1$data.bru,
+                                           model_data1$T1,
+                                           model_data1$T2,
+                                           M0,
+                                           p = c(1,2,4))
+result1$plot1
+result1$plot2
+result1$plot3
+```
+
+```{r}
+result1$delta
+```
+
+```{r}
+start.date2 <- as.POSIXct("2016-10-1T00:00:00", format = "%Y-%m-%dT%H:%M:%OS")
+end.date2 <- as.POSIXct("2017-10-1T00:00:00", format = "%Y-%m-%dT%H:%M:%OS")
+min.longitude2 <- 10.5
+max.longitude2 <- 20
+min.latitude2 <- 40.5
+max.latitude2 <- 50
+
+data2 <- filter_data(horus, 
+                     start.date2, 
+                     end.date2, 
+                     min.longitude2, 
+                     max.longitude2, 
+                     min.latitude2, 
+                     max.latitude2, 
+                     M0)
+```
+
+```{r}
+model_data2 <- prepare_and_fit_model(data2, start.date2, M0)
+input_list2 <- list(model.fit = model_data2$data.fit, 
+                    link.functions = model_data2$link.f, 
+                    T1 = model_data2$T1, 
+                    T2 = model_data2$T2)
+```
+
+```{r}
+posterior_data2 <- get_posterior_and_plot(input_list2, 
+                                          model_data2$data.bru, 
+                                          model_data2$T1,
+                                          model_data2$T2,
+                                          M0)
+posterior_data2$p1
+posterior_data2$p2
+posterior_data2$p3
+posterior_data2$p4
+posterior_data2$p5
+posterior_data2$p6
+```
+
+```{r}
+result2 <- generate_synthetic_and_forecast(input_list2, 
+                                           posterior_data2$post.samp, 
+                                           posterior_data2$beta.p, 
+                                           model_data2$data.bru,
+                                           model_data2$T1,
+                                           model_data2$T2,
+                                           M0,
+                                           p = c(1,3))
+result2$plot1
+result2$plot2
+result2$plot3
+```
+
+```{r}
+result2$delta
+```
+
+```{r}
+# Parameters we use to generate synthetics, which we will refer to as the 'true' parameters
+mu <- 0.292
+K <- 1.063
+alpha <- 2.235
+c <- 0.022
+p <- 1.192
+true.param <- list(mu = mu, K = K, alpha = alpha, c = c, p = p)
+
+# set magnitude distribution parameter
+beta.p <- log(10)
+# set cutoff magnitude
+M0 <- 3
+# set starting time of the synthetic catalogue
+T1 <- 0
+# set end time of the synthetic catalogue
+T2 <- 365
+
+df.true.param <- data.frame(
+  x = unlist(true.param),
+  param = names(true.param)
+)
+```
+
+```{r}
+link.f <- list(
+    mu = \(x) gamma_t(x, 0.1, 0.1),
+    K = \(x) unif_t(x, 0, 10),
+    alpha = \(x) unif_t(x, 0, 10),
+    c_ = \(x) gamma_t(x, 0.1, 0.1),
+    p = \(x) unif_t(x, 1, 10)
+  )
+
+  inv.link.f <- list(
+    mu = \(x) inv_gamma_t(x, 0.1, 0.1),
+    K = \(x) inv_unif_t(x, 0, 10),
+    alpha = \(x) inv_unif_t(x, 0, 10),
+    c_ = \(x) inv_gamma_t(x, 0.1, 0.1),
+    p = \(x) inv_unif_t(x, 1, 10)
+  )
+
+  th.init <- list(
+    th.mu = inv.link.f$mu(0.5),
+    th.K = inv.link.f$K(1),
+    th.alpha = inv.link.f$alpha(1),
+    th.c = inv.link.f$c_(0.1),
+    th.p = inv.link.f$p(1.1)
+  )
+```
+
+```{r}
+# set up list of bru options
+bru.opt.list <- list(
+  bru_verbose = 0, # type of visual output
+  bru_max_iter = 200, # maximum number of iterations
+  # bru_method = list(max_step = 0.5),
+  bru_initial = th.init
+) # parameters initial values
+```
+
+
+```{r}
+Ht.list <- list(
+  Ht0 = NULL,
+  Ht1 = data.frame(ts = c(20), magnitudes = c(6)),
+  Ht2 = data.frame(ts = c(20, 120), magnitudes = c(6, 5)),
+  Ht3 = data.frame(ts = c(20, 120,170), magnitudes = c(6, 5, 4))
+)
+
+# Generate the synthetic catalogs and store them in the lists
+generate_catalogs <- function(Ht, num_catalogs) {
+  synth.cat.list <- vector("list", num_catalogs)
+  input_list <- vector("list", num_catalogs)
+  
+  for (i in 1:num_catalogs) {
+    set.seed(103 - i)
+    synth.cat.temp <- generate_temporal_ETAS_synthetic(
+      theta = true.param,
+      beta.p = beta.p,
+      M0 = M0,
+      T1 = T1,
+      T2 = T2,
+      Ht = Ht
+    )
+    synth.cat.df.temp <- do.call(rbind, synth.cat.temp)
+    synth.cat.df.temp <- synth.cat.df.temp[order(synth.cat.df.temp$ts), ]
+    synth.cat.df.temp$idx.p <- seq_len(nrow(synth.cat.df.temp))
+
+    synth.fit.temp <- Temporal.ETAS(
+      total.data = synth.cat.df.temp,
+      M0 = M0,
+      T1 = T1,
+      T2 = T2,
+      link.functions = link.f,
+      coef.t. = 1,
+      delta.t. = 0.1,
+      N.max. = 5,
+      bru.opt = bru.opt.list
+    )
+
+    synth.cat.list[[i]] <- synth.cat.df.temp
+    input_list[[i]] <- list(
+      model.fit = synth.fit.temp,
+      link.functions = link.f
+    )
+  }
+  
+  list(synth.cat.list = synth.cat.list, input_list = input_list)
+}
+
+# plot
+generate_plot <- function(Ht, num_catalogs, id) {
+  result <- generate_catalogs(Ht, num_catalogs)
+  synth.cat.list <- result$synth.cat.list
+  input_list <- result$input_list
+  
+  get_posterior_and_set_id <- function(input_list, id) {
+    post.list <- get_posterior_param(input.list = input_list)
+    post.list$post.df$cat.used <- paste0(id, " catalogue")
+    return(post.list$post.df)
+  }
+  
+  post.df.list <- lapply(1:num_catalogs, function(i) get_posterior_and_set_id(input_list[[i]], paste0(id, "-", i)))
+  bind.post.df <- do.call(rbind, post.df.list)
+  
+  ggplot(bind.post.df, aes(x = x, y = y, color = cat.used)) +
+    geom_line() +
+    facet_wrap(facets = ~param, scales = "free") +
+    xlab("param") +
+    ylab("pdf") +
+    geom_vline(data = df.true.param, mapping = aes(xintercept = x), linetype = "dashed") +
+    ggtitle(paste("Ht", id))
+}
+
+num_catalogs <- 1
+plots <- lapply(1:length(Ht.list), function(i) generate_plot(Ht.list[[i]], num_catalogs, i))
+
+do.call(grid.arrange, c(plots, ncol = 2))
+```
+
+```{r}
+# Function to generate and plot synthetic earthquake catalogues
+generate_and_plot_catalog <- function(seed) {
+  set.seed(seed)
+  
+  # Generate synthetic earthquake catalogue
+  synth_cat_list <- generate_temporal_ETAS_synthetic(
+    theta = true.param,
+    beta.p = beta.p,
+    M0 = M0,
+    T1 = T1,
+    T2 = T2,
+    Ht = data.frame(ts = c(20, 120), magnitudes = c(6, 5))
+  )
+  
+  synth_cat_df <- do.call(rbind, synth_cat_list)
+  
+  # Plotting the synthetic catalog points
+  pl1 <- ggplot(synth_cat_df, aes(ts, magnitudes, color = as.factor(gen))) +
+    geom_point() +
+    labs(color = "Generation")
+
+  # Calculate cumulative number of events
+  t_breaks <- seq(T1, T2, by = 1)  # Adjust 'by' if needed for different intervals
+  N_cumsum <- vapply(t_breaks, \(x) sum(synth_cat_df$ts < x), numeric(1))
+  
+  # Prepare data frame for cumulative plot
+  df_to_cumsum_plot <- data.frame(ts = t_breaks, N.cum = N_cumsum)
+  
+  # Plotting cumulative number of events
+  pl2 <- ggplot(df_to_cumsum_plot, aes(ts, N.cum)) +
+    geom_line() +
+    ylab("Cumulative number of events")
+
+  # Using inlabru or other methods to arrange multiple plots
+  multiplot(pl1, pl2, cols = 2)
+  
+  return(synth_cat_df)
+}
+```
+
+```{r}
+synth.cat.df1 <- generate_and_plot_catalog(194)
+synth.cat.df1b <- generate_and_plot_catalog(96)
+```
+
+```{r}
+synth.cat.df2 <- generate_and_plot_catalog(180)
+synth.cat.df2b <- generate_and_plot_catalog(89)
+```
+
+```{r}
+synth.cat.df3 <- generate_and_plot_catalog(111)
+synth.cat.df3b <- generate_and_plot_catalog(97)
+```
+
+```{r}
+synth.cat.df4 <- generate_and_plot_catalog(192)
+synth.cat.df4b <- generate_and_plot_catalog(187)
+```
+
+```{r}
+startingValues <- data.frame(
+  mu = c(5.,mu),
+  K = c(1.,K),
+  alpha = c(5.,alpha),
+  c = c(0.3,c),
+  p = c(1.5,p)
+)
+nRealisations <- length(startingValues$mu)
+```
+
+```{r}
+generate_posterior_plots <- function(synth_cat_df, scenario_label, nRealisations, startingValues) {
+  plots <- list()
+  trueParas <- data.frame(value = c(mu, K, alpha, c, p), param = c("mu", "K", "alpha", "c", "p"))
+  
+  list.output <- list()
+  
+  for (i in seq_len(nRealisations)) {
+    
+    # Load a set of parameters that we will need to tweak for this application
+    fpath <- system.file("extdata", "user_input_synthetic_noCatalogue.txt", package = "ETAS.inlabru")
+    list.input <- create_input_list_temporal_noCatalogue(fpath)
+    
+    ####################
+    # Tweak the variables laoded from the input file
+    list.input$M0 <- M0
+    list.input$time.int <- c(0, T2)
+    list.input$T12 <- c(0, T2)
+
+    # Change the starting location, measured on the ETAS scale
+    list.input$mu.init <- startingValues$mu[i]
+    list.input$alpha.init <- startingValues$alpha[i]
+    list.input$K.init <- startingValues$K[i]
+    list.input$c.init <- startingValues$c[i]
+    list.input$p.init <- startingValues$p[i]
+
+    link.f <- list(
+      mu = \(x) gamma_t(x, a_mu, b_mu),
+      K = \(x) loggaus_t(x, a_K, b_K),
+      alpha = \(x) unif_t(x, a_alpha, b_alpha),
+      c_ = \(x) unif_t(x, a_c, b_c),
+      p = \(x) unif_t(x, a_p, b_p)
+    )
+
+   # initial value - convert from ETAS scale to internal scale
+    list.input$th.init <- list(
+      th.mu = inv_gamma_t(list.input$mu.init, list.input$a_mu, list.input$b_mu),
+      th.K = inv_loggaus_t(list.input$K.init, list.input$a_K, list.input$b_K),
+      th.alpha = inv_unif_t(list.input$alpha.init, list.input$a_alpha, list.input$b_alpha),
+      th.c = inv_unif_t(list.input$c.init, list.input$a_c, list.input$b_c),
+      th.p = inv_unif_t(list.input$p.init, list.input$a_p, list.input$b_p)
+    )
+
+    # Define options for inlabru
+    if (is.null(list.input$max_step)) {
+      list.input$bru.opt.list <- list(
+        bru_verbose = 0, # type of visual output
+        bru_max_iter = list.input$max_iter, # maximum number of iterations
+        # bru_method = list(max_step = 0.5),
+        bru_initial = list.input$th.init
+      ) # parameters initial values
+    } else {
+      list.input$bru.opt.list <- list(
+        bru_verbose = 0, # type of visual output
+        bru_max_iter = list.input$max_iter, # maximum number of iterations
+        bru_method = list(max_step = list.input$max_step),
+        bru_initial = list.input$th.init
+      ) # parameters initial values
+    }
+  
+    ## Add out catalogue to the input list
+      
+      # Adding catalog and formatting for bru
+      list.input$catalog <- data.frame(
+        time_diff = synth_cat_df$ts,
+        magnitudes = synth_cat_df$magnitudes
+      )
+      list.input$catalog.bru <- data.frame(
+        ts = synth_cat_df$ts,
+        magnitudes = synth_cat_df$magnitudes,
+        idx.p = seq_len(nrow(synth_cat_df))
+      )
+      
+      # Run the model and store results
+      ETAS.model.fit <- Temporal.ETAS.fit(list.input)
+      list.output[[i]] <- append(list.input, list(model.fit = ETAS.model.fit))
+      list.output[[i]]$runtime <- sum(list.output[[i]]$model.fit$bru_timings$Time)
+      list.output[[i]]$nEvents <- length(list.output[[i]]$catalog[, 1])
+    }
+    
+    # Aggregate results and create plots
+    post.df <- data.frame()
+    for (i in seq_len(nRealisations)) {
+      post.list <- get_posterior_param(input.list = list.output[[i]])
+      post.df.tmp <- post.list[[1]]
+      post.df.tmp$id <- i
+      post.df <- rbind(post.df, post.df.tmp)
+    }
+    
+    plot <- ggplot(post.df, aes(x = x, y = y, group = id, color = factor(id), lty = factor(id))) +
+      geom_line() +
+      facet_wrap(facets = vars(param), scales = "free", labeller = label_parsed, nrow = 1) +
+      geom_vline(aes(xintercept = value), data = trueParas, color = "black", linetype = 2) +
+      labs(color = "Initial ETAS Para. Set", linetype = "Initial ETAS Para. Set") +
+      ggtitle(paste(scenario_label, ", nEvents =", length(synth_cat_df$ts))) +
+      xlab("ETAS Posteriors") +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      theme(legend.position = "hidden") +
+      theme(plot.title = element_text(size = 12))
+    
+    return(plot)
+}
+
+```
+
+```{r}
+# Example of using the function
+plot1 <- generate_posterior_plots(synth.cat.df1, "Scenario 1", nRealisations, startingValues)
+plot1b <- generate_posterior_plots(synth.cat.df1b, "Scenario 1b", nRealisations, startingValues)
+plot2 <- generate_posterior_plots(synth.cat.df2, "Scenario 2", nRealisations, startingValues)
+plot2b <- generate_posterior_plots(synth.cat.df2b, "Scenario 2b", nRealisations, startingValues)
+plot3 <- generate_posterior_plots(synth.cat.df3, "Scenario 3", nRealisations, startingValues)
+plot3b <- generate_posterior_plots(synth.cat.df3b, "Scenario 3b", nRealisations, startingValues)
+plot4 <- generate_posterior_plots(synth.cat.df4, "Scenario 4", nRealisations, startingValues)
+plot4b <- generate_posterior_plots(synth.cat.df4b, "Scenario 4b", nRealisations, startingValues)
+```
+
+```{r}
+plt <- grid_arrange_shared_legend(plot1, plot1b,
+                                  plot2, plot2b,
+                                  plot3, plot3b,
+                                  plot4, plot4b,
+                                  ncol = 2, nrow = 4, position = "bottom")
+```
